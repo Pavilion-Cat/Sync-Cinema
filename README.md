@@ -68,14 +68,14 @@ services:
 ### 5. 启动服务
 
 ```bash
-docker-compose up -d --build
+docker compose up -d --build
 ```
 
 ### 6. 访问
 
 打开浏览器访问：`http://你的服务器IP:你设置的端口`
 
-## ⚙️ 配置说明
+## 配置说明
 
 | 变量名 | 说明 | 默认值 |
 | :--- | :--- | :--- |
@@ -84,13 +84,13 @@ docker-compose up -d --build
 | `ADMIN_PASSWORD` | 主持人控制所需的密码 | `admin_control` |
 | `ports` | 宿主机映射端口 | `80` |
 
-> **⚠️ 重要提示**：如果你更换了服务器的 IP 地址，需要修改 `docker-compose.yml` 中的 `WS_URL` 并重新执行 `docker-compose up -d --build`。
+> **重要提示**：如果你更换了服务器的 IP 地址，需要修改 `docker-compose.yml` 中的 `WS_URL` 并重新执行 `docker-compose up -d --build`。
 
-## 🤝 贡献
+## 贡献
 
 欢迎提交 Issue 和 Pull Request！
 
-## 📄 开源协议
+## 开源协议
 
 本项目基于 [GNU General Public License v3.0](LICENSE) 开源。
 
