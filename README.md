@@ -1,102 +1,196 @@
 # Sync-Cinema
-> 一款基于 WebSocket 的私人实时同步观影工具，支持主持人精准控制，观众零延迟同步。
+
+一个用于局域网 / 私有部署场景的同步观影系统：主持人控制播放，观众端自动跟随，实现多端一致的播放进度、暂停状态与切片切换。
 
 <div align="center">
 
 ![Next.js](https://img.shields.io/badge/Next.js-16-black?style=flat-square&logo=next.js)
-![Node](https://img.shields.io/badge/Node.js-18+-green?style=flat-square&logo=node.js)
+![Node](https://img.shields.io/badge/Node.js-20+-green?style=flat-square&logo=node.js)
 ![License](https://img.shields.io/badge/License-GPLv3-blue?style=flat-square)
 ![Docker](https://img.shields.io/badge/Docker-Ready-blue?style=flat-square&logo=docker)
 
 </div>
 
-## 核心功能
+## 特性
 
-- **实时同步**：基于 WebSocket，毫秒级同步播放、暂停、进度跳转。
-- **角色分离**：
-  - **主持人**：拥有控制权，可切换视频、控制进度、强制同步。
-  - **观众**：被动跟随，享受沉浸式观影体验。
-- **私密安全**：通过房间密码和管理员密码保护访问。
-- **容器化部署**：集成 Nginx、Next.js、Node.js 后端于一个 Docker 镜像中，部署极简。
-- **现代化 UI**：基于 Shadcn/UI 构建的精美界面
+- 主持人 / 观众双角色模型
+- 基于 WebSocket 的实时同步
+- 支持播放、暂停、拖动、强制同步
+- 观众端偏移检测与一键追平
+- 支持全屏场景下的同步提示
+- 支持 Docker 部署
+- 支持基于 Cookie 的登录态鉴权
 
-## 快速开始 (推荐使用 Docker)
+## 技术栈
 
-这是最简单的部署方式，无需手动配置 Node.js 环境。
+- Next.js 16
+- React 19
+- Node.js
+- ws
+- Nginx
+- Docker
 
-### 1. 准备环境
+## 项目结构
 
-确保你的服务器已安装 **Docker** 和 **Docker Compose**。
+```text
+src/app/           Next.js 页面
+server/            同步服务与视频接口
+public/            静态资源
+Dockerfile         容器构建脚本
+docker-compose.yml Docker Compose 示例配置
+nginx.conf         反向代理配置
+```
 
-### 2. 克隆项目
+## 使用场景
+
+适用于以下场景：
+
+- 家庭影院 / 局域网同步观影
+- 私有服务器上的多人同步看片
+- 由一名主持人统一控制节奏的放映场景
+
+## 快速开始
+
+### 1. 克隆项目
 
 ```bash
 git clone https://github.com/Pavilion-Cat/Sync-Cinema.git
 cd Sync-Cinema
 ```
 
-### 3. 配置参数
+### 2. 准备视频文件
 
-修改根目录下的 `docker-compose.yml` 文件，填写你的服务器信息：
+将可播放的视频文件放到：
 
-```yaml
-services:
-  yunge_cinema:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      # 构建时传入服务器的公网 IP 或域名
-      args:
-        WS_URL: "ws://example:80" 
-    container_name: Sync-Cinema-yunge
-    restart: always
-    ports:
-      - "80:80" # 宿主机80 -> 容器内80
-    environment:
-      # 后端环境变量,生产环境请修改为安全的值
-      - SYNC_PASSWORD=default
-      - ADMIN_PASSWORD=admin_control
-    volumes:
-      # 挂载视频目录
-      - ./server/videos:/app/server/videos
+```text
+server/videos
 ```
 
-### 4. 放置视频文件
+### 3. 配置环境
 
-将你的 MP4 视频文件放入项目目录的 `server/videos` 文件夹中。
+编辑 `docker-compose.yml`，至少配置以下环境变量：
 
-### 5. 启动服务
+- `SYNC_PASSWORD`
+- `ADMIN_PASSWORD`
+- `AUTH_TOKEN_SECRET`
+
+其中：
+
+- `SYNC_PASSWORD`：观众进入房间的密码
+- `ADMIN_PASSWORD`：主持人控制页面的密码
+- `AUTH_TOKEN_SECRET`：服务端签名登录态所使用的密钥
+
+> 生产环境请使用高强度随机值，不要使用弱口令。
+
+### 4. 启动
 
 ```bash
 docker compose up -d --build
 ```
 
-### 6. 访问
+### 5. 访问系统
 
-打开浏览器访问：`http://你的服务器IP:你设置的端口`
+打开部署地址后：
 
-## 配置说明
+- 输入房间密码可作为观众进入
+- 输入房间密码 + 主持人密码可进入主持人页面
 
-| 变量名 | 说明 | 默认值 |
-| :--- | :--- | :--- |
-| `WS_URL` | WebSocket 连接地址（构建时写入，必须为公网地址） | `ws://localhost:80` |
-| `SYNC_PASSWORD` | 观众进入房间所需的密码 | `default` |
-| `ADMIN_PASSWORD` | 主持人控制所需的密码 | `admin_control` |
-| `ports` | 宿主机映射端口 | `80` |
+## 登录与鉴权
 
-> **重要提示**：如果你更换了服务器的 IP 地址，需要修改 `docker-compose.yml` 中的 `WS_URL` 并重新执行 `docker-compose up -d --build`。
+当前版本使用服务端签名 Token + Cookie 作为登录态：
+
+- 登录接口：`POST /api/auth/login`
+- 登录状态：`GET /api/auth/me`
+- 退出登录：`POST /api/auth/logout`
+- WebSocket：`/sync`
+
+说明：
+
+- 前端不再持久化保存房间密码或主持人密码
+- 登录成功后由服务端签发 Cookie
+- WebSocket 握手阶段通过 Cookie 完成鉴权
+- `/api/videos` 也需要登录后访问
+
+## 本地开发
+
+安装依赖：
+
+```bash
+pnpm install
+```
+
+启动前端开发环境：
+
+```bash
+pnpm dev
+```
+
+启动同步服务：
+
+```bash
+node server/index.js
+```
+
+生产构建：
+
+```bash
+pnpm build
+```
+
+## Docker 部署说明
+
+仓库中提供的 `docker-compose.yml` 是一个通用示例，适合直接端口映射的部署方式。
+
+如果你的生产环境使用：
+
+- 反向代理
+- 容器网络转发
+- 域名网关
+- HTTPS / WSS
+
+请根据实际外部访问地址调整构建参数中的 `WS_URL`。
+
+注意：
+
+- `WS_URL` 是前端在构建时写入的 WebSocket 地址
+- 它应当指向“浏览器最终访问到的公开地址”
+- 如果外部访问地址发生变化，需要重新构建镜像
+
+## 配置项
+
+| 名称 | 说明 |
+| --- | --- |
+| `WS_URL` | 前端使用的 WebSocket 地址，构建时注入 |
+| `SYNC_PASSWORD` | 观众访问密码 |
+| `ADMIN_PASSWORD` | 主持人访问密码 |
+| `AUTH_TOKEN_SECRET` | 用于签名登录 Token 的密钥 |
+
+## 行为说明
+
+- 主持人端拥有播放控制权
+- 观众端会自动跟随主持人状态
+- 观众端可在检测到明显进度偏差时主动执行同步
+- 全屏状态下会使用原生确认框进行同步提示，以避免普通弹窗被全屏层遮挡
+
+## 适配与部署建议
+
+- 建议通过反向代理统一暴露 HTTP 与 WebSocket
+- 如果使用 Nginx，请确保 `/sync` 已正确配置 Upgrade 头
+- 如果需要记录真实客户端 IP，请透传 `X-Real-IP` 与 `X-Forwarded-For`
+- 生产环境建议使用 HTTPS / WSS
+
+## 安全说明
+
+- 请务必为 `SYNC_PASSWORD`、`ADMIN_PASSWORD`、`AUTH_TOKEN_SECRET` 设置安全值
+- 不建议在公开环境中使用弱密码
+- 若配置发生泄露，请及时更换相关凭据
+
+## 许可证
+
+本项目采用 [GPL-3.0](LICENSE) 开源许可。
+
+如果你分发了修改后的版本，请遵守 GPL 协议要求。
 
 ## 贡献
 
-欢迎提交 Issue 和 Pull Request！
-
-## 开源协议
-
-本项目基于 [GNU General Public License v3.0](LICENSE) 开源。
-
-> **注意**：这意味着如果你修改并分发了本项目的代码，你必须同样以 GPLv3 协议开源你的修改内容。
-
----
-
-**Made with by [Pavilion_Cat]**
-**Star ⭐ this repo if it helps you!**
+欢迎提交 Issue 和 Pull Request。

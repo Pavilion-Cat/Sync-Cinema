@@ -12,8 +12,9 @@ services:
       - "80:80" # 宿主机80 -> 容器内80
     environment:
       # 后端环境变量,生产环境请修改为安全的值
-      - SYNC_PASSWORD=default
-      - ADMIN_PASSWORD=admin_control
+      - SYNC_PASSWORD=请设置安全的房间密码
+      - ADMIN_PASSWORD=请设置安全的主持人密码
+      - AUTH_TOKEN_SECRET=请设置长度足够的随机签名密钥
     volumes:
       # 挂载视频目录
       - ./server/videos:/app/server/videos

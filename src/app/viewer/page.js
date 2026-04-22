@@ -1,11 +1,10 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-// 引入 Dialog 组件
 import {
   Dialog,
   DialogContent,
@@ -15,190 +14,341 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 
+const TIME_CHECK_INTERVAL_MS = 20000;
+const DESYNC_PROMPT_THRESHOLD_SECONDS = 5;
+const SYNC_TIME_THRESHOLD_SECONDS = 0.75;
+const DUPLICATE_TIME_THRESHOLD_SECONDS = 0.1;
+
+function runWithApplyGuard(applyFlagRef, action) {
+  applyFlagRef.current = true;
+  try {
+    return Promise.resolve(action()).finally(() => {
+      applyFlagRef.current = false;
+    });
+  } catch (error) {
+    applyFlagRef.current = false;
+    throw error;
+  }
+}
+
+function applyMediaState(player, { time, playing }) {
+  if (typeof time === "number" && Number.isFinite(time)) {
+    player.currentTime = time;
+  }
+
+  return playing ? player.play().catch(() => {}) : Promise.resolve(player.pause());
+}
+
+function bindOnceLoadedMetadata(player, handler) {
+  player.addEventListener("loadedmetadata", handler, { once: true });
+}
+
+function formatTime(seconds) {
+  const safeSeconds = Number.isFinite(seconds) ? seconds : 0;
+  const minutes = Math.floor(safeSeconds / 60);
+  const remain = Math.floor(safeSeconds % 60);
+  return `${minutes.toString().padStart(2, "0")}:${remain.toString().padStart(2, "0")}`;
+}
+
 export default function ViewerPage() {
   const router = useRouter();
   const playerRef = useRef(null);
   const wsRef = useRef(null);
-  
-  const [status, setStatus] = useState("等待连接...");
-  const [isConnected, setIsConnected] = useState(false);
-  
-  // 状态：控制弹窗显示
-  const [showSyncDialog, setShowSyncDialog] = useState(false);
-  // 标记：防止在弹窗打开时重复触发检查
   const isCheckingRef = useRef(false);
+  const pendingCheckRef = useRef(null);
+  const isApplyingSyncRef = useRef(false);
+  const currentFileRef = useRef(null);
+  const lastAppliedSyncRef = useRef({ file: null, time: null, playing: null });
+
+  const [status, setStatus] = useState("正在验证观众身份...");
+  const [isConnected, setIsConnected] = useState(false);
+  const [showSyncDialog, setShowSyncDialog] = useState(false);
+
+  const handleManualSync = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: "requestSync" }));
+      setStatus("正在请求同步...");
+    } else {
+      setStatus("未连接到服务器");
+    }
+  }, []);
+
+  const handleFullscreenSyncPrompt = useCallback(() => {
+    const pendingCheck = pendingCheckRef.current;
+    if (!pendingCheck) return;
+
+    const confirmSync = window.confirm(
+      `检测到您的播放进度与主持人存在 ${pendingCheck.diff.toFixed(1)} 秒偏差，是否立即同步？`
+    );
+
+    isCheckingRef.current = false;
+    pendingCheckRef.current = null;
+
+    if (confirmSync) {
+      handleManualSync();
+    }
+  }, [handleManualSync]);
+
+  const handleRoleAssigned = useCallback((msg) => {
+    setStatus(msg.ip ? `✅ 已连接 (IP: ${msg.ip})` : "✅ 已连接，等待主持人...");
+  }, []);
+
+  const handleTimeCheckResult = useCallback((msg, player) => {
+    const localTime = player.currentTime;
+    const serverTime = typeof msg.time === "number" ? msg.time : 0;
+    const diff = Math.abs(localTime - serverTime);
+
+    if (diff > DESYNC_PROMPT_THRESHOLD_SECONDS) {
+      isCheckingRef.current = true;
+      pendingCheckRef.current = { time: serverTime, localTime, diff };
+
+      if (document.fullscreenElement) {
+        handleFullscreenSyncPrompt();
+      } else {
+        setShowSyncDialog(true);
+      }
+    }
+  }, [handleFullscreenSyncPrompt]);
+
+  const handleAuthoritativeSyncMessage = useCallback((msg, player) => {
+    const { file, time, playing } = msg;
+    if (!file) return;
+
+    const currentFile = currentFileRef.current;
+    const targetTime = typeof time === "number" ? time : 0;
+    const normalizedPlaying = Boolean(playing);
+    const timeDiff = Math.abs(player.currentTime - targetTime);
+    const shouldUpdateTime = currentFile !== file || !Number.isFinite(player.currentTime) || timeDiff > SYNC_TIME_THRESHOLD_SECONDS;
+    const shouldUpdatePlayback = player.paused === normalizedPlaying;
+    const lastApplied = lastAppliedSyncRef.current;
+    const isDuplicateSync =
+      lastApplied.file === file &&
+      typeof lastApplied.time === "number" &&
+      Math.abs(lastApplied.time - targetTime) < DUPLICATE_TIME_THRESHOLD_SECONDS &&
+      lastApplied.playing === normalizedPlaying;
+
+    if (currentFile !== file) {
+      currentFileRef.current = file;
+      lastAppliedSyncRef.current = { file, time: targetTime, playing: normalizedPlaying };
+      player.src = `/videos/${encodeURIComponent(file)}`;
+      bindOnceLoadedMetadata(player, () => {
+        runWithApplyGuard(isApplyingSyncRef, () => applyMediaState(player, { time: targetTime, playing: normalizedPlaying }));
+      });
+    } else if (!isDuplicateSync || shouldUpdateTime || shouldUpdatePlayback) {
+      runWithApplyGuard(isApplyingSyncRef, () => {
+        if (shouldUpdateTime) {
+          player.currentTime = targetTime;
+        }
+
+        if (!shouldUpdatePlayback) {
+          return Promise.resolve();
+        }
+
+        return normalizedPlaying ? player.play().catch(() => {}) : Promise.resolve(player.pause());
+      });
+      lastAppliedSyncRef.current = { file, time: targetTime, playing: normalizedPlaying };
+    }
+
+    setStatus(`⏱ 已同步: ${formatTime(targetTime)}`);
+  }, []);
+
+  const handlePlaybackCommand = useCallback((msg, player) => {
+    if (msg.type === "load") {
+      currentFileRef.current = msg.file || null;
+      lastAppliedSyncRef.current = { file: msg.file || null, time: null, playing: null };
+      if (msg.file) {
+        const nextSrc = `/videos/${encodeURIComponent(msg.file)}`;
+        if (player.src !== nextSrc) {
+          player.src = nextSrc;
+        }
+        bindOnceLoadedMetadata(player, () => {
+          const latestState = lastAppliedSyncRef.current;
+          if (latestState.file !== msg.file) {
+            return;
+          }
+          runWithApplyGuard(isApplyingSyncRef, () => applyMediaState(player, {
+            time: typeof latestState.time === "number" ? latestState.time : 0,
+            playing: Boolean(latestState.playing),
+          }));
+        });
+      }
+      setStatus("加载视频中...");
+      return;
+    }
+
+    if (isApplyingSyncRef.current) {
+      return;
+    }
+
+    if (msg.type === "seek" && typeof msg.time === "number" && Number.isFinite(msg.time)) {
+      player.currentTime = msg.time;
+      return;
+    }
+
+    if (msg.type === "play") {
+      player.play().catch(() => {});
+      return;
+    }
+
+    if (msg.type === "pause") {
+      player.pause();
+    }
+  }, []);
+
+  const dispatchSyncMessage = useCallback((msg) => {
+    const player = playerRef.current;
+    if (!player) return;
+
+    if (msg.type === "roleAssigned") {
+      handleRoleAssigned(msg);
+      return;
+    }
+
+    if (msg.type === "timeCheckResult") {
+      handleTimeCheckResult(msg, player);
+      return;
+    }
+
+    if (msg.type === "authoritativeState" || msg.type === "authoritativeSync") {
+      handleAuthoritativeSyncMessage(msg, player);
+      return;
+    }
+
+    if (msg.type === "noContent") {
+      setStatus(`⚠️ ${msg.reason}`);
+      return;
+    }
+
+    if (msg.type === "adminLeft") {
+      setStatus("主持人已离线，等待重新接管...");
+      return;
+    }
+
+    if (["load", "seek", "play", "pause"].includes(msg.type)) {
+      handlePlaybackCommand(msg, player);
+    }
+  }, [handleAuthoritativeSyncMessage, handlePlaybackCommand, handleRoleAssigned, handleTimeCheckResult]);
 
   useEffect(() => {
-    const roomPass = sessionStorage.getItem("roomPass");
-    const adminPass = sessionStorage.getItem("adminPass");
-    const isAdmin = sessionStorage.getItem("isAdmin") === 'true';
+    let cancelled = false;
+    let activeWs = null;
 
-    if (isAdmin) {
-      router.push("/admin");
-      return;
-    }
-    
-    if (!roomPass) {
-      router.push("/");
-      return;
-    }
+    const initializePage = async () => {
+      try {
+        const authRes = await fetch("/api/auth/me", { credentials: "include" });
+        const authData = await authRes.json();
 
-    const wsUrl = `${process.env.NEXT_PUBLIC_WS_URL}/sync?pass=${encodeURIComponent(roomPass)}&adminPass=${encodeURIComponent(adminPass || '')}`;
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+        if (!authData?.authenticated) {
+          router.replace("/?error=auth");
+          return;
+        }
 
-    ws.onopen = () => {
-      setIsConnected(true);
-      setStatus("已连接，等待主持人...");
-    };
+        activeWs = new WebSocket(`${process.env.NEXT_PUBLIC_WS_URL}/sync`);
+        wsRef.current = activeWs;
 
-    ws.onmessage = (event) => handleSyncMessage(JSON.parse(event.data.toString()));
+        activeWs.onopen = () => {
+          if (cancelled) return;
+          setIsConnected(true);
+          setStatus("已连接，等待主持人...");
+        };
 
-    ws.onclose = (event) => {
-      setIsConnected(false);
-      if (event.code === 4001 || event.code === 4000) {
-        sessionStorage.clear();
-        router.push("/?error=auth");
-      } else {
-        setStatus("连接断开，尝试重连...");
+        activeWs.onmessage = (event) => {
+          const msg = JSON.parse(event.data.toString());
+          dispatchSyncMessage(msg);
+        };
+
+        activeWs.onclose = (event) => {
+          if (cancelled) return;
+          setIsConnected(false);
+          if (event.code === 4000 || event.code === 4001) {
+            router.replace("/?error=auth");
+            return;
+          }
+          if (event.code !== 1000) {
+            setStatus("连接断开，尝试重连...");
+          }
+        };
+      } catch (error) {
+        console.error(error);
+        if (!cancelled) {
+          setStatus("❌ 鉴权初始化失败");
+          router.replace("/?error=auth");
+        }
       }
     };
 
-    return () => {
-      ws.close();
-    };
-  }, [router]);
+    initializePage();
 
-  // 定时检查逻辑
+    return () => {
+      cancelled = true;
+      const player = playerRef.current;
+      if (player) {
+        player.onloadedmetadata = null;
+      }
+      activeWs?.close();
+      wsRef.current = null;
+    };
+  }, [dispatchSyncMessage, router]);
+
   useEffect(() => {
-    const checkInterval = setInterval(() => {
-      // 如果未连接、视频未加载 或 弹窗已打开，则跳过
+    const checkInterval = window.setInterval(() => {
       if (
-        !wsRef.current || 
-        wsRef.current.readyState !== WebSocket.OPEN || 
+        !wsRef.current ||
+        wsRef.current.readyState !== WebSocket.OPEN ||
         !playerRef.current?.duration ||
         isCheckingRef.current
       ) {
         return;
       }
 
-      // 发送静默检查请求
-      wsRef.current.send(JSON.stringify({ type: 'checkTime' }));
-      
-    }, 20000); // 20秒检查一次
+      wsRef.current.send(JSON.stringify({ type: "checkTime" }));
+    }, TIME_CHECK_INTERVAL_MS);
 
-    return () => clearInterval(checkInterval);
+    return () => window.clearInterval(checkInterval);
   }, []);
 
-  const handleSyncMessage = (msg) => {
-    const player = playerRef.current;
-    if (!player) return;
-
-    if (msg.type === 'roleAssigned') {
-      // 如果有 IP 信息，更新状态栏显示
-      if (msg.ip) {
-        setStatus(`✅ 已连接 (IP: ${msg.ip})`);
-      }
-    }
-
-    // 处理时间校验结果
-    if (msg.type === 'timeCheckResult') {
-      const { time } = msg;
-      const localTime = player.currentTime;
-      const diff = Math.abs(localTime - time);
-
-      console.log(`[校验] 本地: ${localTime.toFixed(1)}s | 服务器: ${time.toFixed(1)}s | 误差: ${diff.toFixed(1)}s`);
-
-      if (diff > 5) {
-        // 误差超过5秒，锁住检查标记，弹窗
-        isCheckingRef.current = true;
-        setShowSyncDialog(true);
-      }
-      return; // 仅校验，不同步
-    }
-
-    // 处理权威状态
-    if (msg.type === 'authoritativeState' || msg.type === 'authoritativeSync') {
-      const { file, time, playing } = msg;
-      const currentSrc = player.src ? decodeURIComponent(player.src.split('/').pop()) : null;
-      
-      if (file && currentSrc !== file) {
-        player.src = `/videos/${encodeURIComponent(file)}`;
-        player.onloadedmetadata = () => {
-          player.currentTime = time || 0;
-          if (playing) player.play().catch(()=>{});
-          else player.pause();
-        };
-      } else if (file) {
-        player.currentTime = time || 0;
-        playing ? player.play().catch(()=>{}) : player.pause();
-      }
-      setStatus(`⏱ 已同步: ${formatTime(time || 0)}`);
-    }
-    
-    if (msg.type === 'noContent') {
-      setStatus("⚠️ " + msg.reason);
-    }
-    
-    if (msg.type === 'load') {
-      player.src = `/videos/${encodeURIComponent(msg.file)}`;
-      setStatus("加载视频中...");
-    }
-    if (msg.type === 'seek') {
-      player.currentTime = msg.time;
-    }
-    if (msg.type === 'play') {
-      player.play().catch(()=>{});
-    }
-    if (msg.type === 'pause') {
-      player.pause();
-    }
-  };
-
-  // 手动同步按钮逻辑
-  const handleManualSync = () => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'requestSync' }));
-      setStatus("正在请求同步...");
-    } else {
-      setStatus("未连接到服务器");
-    }
-  };
-
-  // 弹窗确认同步逻辑
   const handleDialogConfirm = () => {
     setShowSyncDialog(false);
-    isCheckingRef.current = false; // 解锁检查
-    handleManualSync(); // 触发真正的同步
+    isCheckingRef.current = false;
+    pendingCheckRef.current = null;
+    handleManualSync();
   };
 
-  // 弹窗取消逻辑
   const handleDialogCancel = () => {
     setShowSyncDialog(false);
-    isCheckingRef.current = false; // 解锁检查
+    isCheckingRef.current = false;
+    pendingCheckRef.current = null;
   };
 
   const toggleFullscreen = () => {
     if (!document.fullscreenElement && playerRef.current) {
       playerRef.current.requestFullscreen();
-    } else {
-      document.exitFullscreen();
+      return;
     }
+    document.exitFullscreen();
   };
 
-  const formatTime = (seconds) => {
-    const m = Math.floor(seconds / 60);
-    const s = Math.floor(seconds % 60);
-    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  const handleLogout = async () => {
+    try {
+      await fetch("/api/auth/logout", {
+        method: "POST",
+        credentials: "include",
+      });
+    } finally {
+      router.replace("/");
+    }
   };
 
   return (
     <div className="min-h-screen flex flex-col items-center p-4 bg-background">
-      {/* 同步提示弹窗 */}
-      <Dialog open={showSyncDialog} onOpenChange={(open) => {
-        // 点击遮罩层关闭时也触发取消逻辑
-        if(!open) handleDialogCancel();
-      }}>
+      <Dialog
+        open={showSyncDialog}
+        onOpenChange={(open) => {
+          if (!open) {
+            handleDialogCancel();
+          }
+        }}
+      >
         <DialogContent className="sm:max-w-[425px]">
           <DialogHeader>
             <DialogTitle>⚠️ 播放进度不一致</DialogTitle>
@@ -217,8 +367,9 @@ export default function ViewerPage() {
         <div className="flex justify-between items-center">
           <h1 className="text-2xl font-bold">云阁 私人同步影院</h1>
           <div className="flex items-center gap-2">
-            <span className={`sync-indicator ${isConnected ? 'active' : ''}`}></span>
+            <span className={`sync-indicator ${isConnected ? "active" : ""}`}></span>
             <Badge variant="secondary">观众</Badge>
+            <Button variant="outline" size="sm" onClick={handleLogout}>退出登录</Button>
           </div>
         </div>
 
@@ -230,29 +381,23 @@ export default function ViewerPage() {
         </Alert>
 
         <div className="bg-black rounded-lg overflow-hidden shadow-lg relative">
-          <video 
-            ref={playerRef} 
-            className="w-full aspect-video" 
-            playsInline
-          />
+          <video ref={playerRef} className="w-full aspect-video" playsInline />
         </div>
 
         <div className="flex justify-center gap-4">
-          <Button variant="outline" onClick={()=> playerRef.current?.play()}>播放</Button>
-          <Button variant="outline" onClick={()=> playerRef.current?.pause()}>暂停</Button>
+          <Button variant="outline" onClick={() => playerRef.current?.play()}>播放</Button>
+          <Button variant="outline" onClick={() => playerRef.current?.pause()}>暂停</Button>
           <Button variant="outline" onClick={toggleFullscreen}>⛶ 全屏</Button>
-          <Button 
-            variant="outline" 
+          <Button
+            variant="outline"
             className="border-purple-500 text-purple-600 hover:bg-purple-50 dark:hover:bg-purple-900/20"
             onClick={handleManualSync}
           >
             手动同步
           </Button>
         </div>
-        
-        <div className="text-center text-sm text-muted-foreground">
-          {status}
-        </div>
+
+        <div className="text-center text-sm text-muted-foreground">{status}</div>
       </div>
     </div>
   );

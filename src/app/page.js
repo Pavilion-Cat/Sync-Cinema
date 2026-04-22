@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -14,65 +14,66 @@ export default function LoginPage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
-  const handleLogin = () => {
-    if (!roomPass.trim()) {
-      setError("请输入房间密码");
-      return;
-    }
-    setLoading(true);
-    setError("");
+  useEffect(() => {
+    let cancelled = false;
 
-    // 先尝试连接 WebSocket 进行验证（这里是后端在新加入用户时会出现一次断连日志的原因）
-    const wsUrl = `${process.env.NEXT_PUBLIC_WS_URL}/sync?pass=${encodeURIComponent(roomPass)}&adminPass=${encodeURIComponent(adminPass)}`;
-    const ws = new WebSocket(wsUrl);
-
-    // 设置超时（5秒）
-    const timeout = setTimeout(() => {
-      ws.close();
-      setError("连接超时，请检查后端服务是否启动");
-      setLoading(false);
-    }, 5000);
-
-    ws.onopen = () => {
-      clearTimeout(timeout);
-      // 连接成功，等待服务器分配角色
-    };
-
-    ws.onmessage = (event) => {
-      const msg = JSON.parse(event.data.toString());
-      
-      // 收到角色分配消息，说明密码正确
-      if (msg.type === 'roleAssigned') {
-        // 2. 验证成功，保存状态
-        sessionStorage.setItem("roomPass", roomPass);
-        sessionStorage.setItem("adminPass", adminPass);
-        sessionStorage.setItem("isAdmin", msg.isAdmin); // 保存角色状态
-
-        // 3. 关闭连接并跳转
-        ws.close();
-        
-        if (msg.isAdmin) {
-          router.push("/admin");
-        } else {
-          router.push("/viewer");
+    const checkAuth = async () => {
+      try {
+        const res = await fetch("/api/auth/me", { credentials: "include" });
+        const data = await res.json();
+        if (cancelled || !data?.authenticated) return;
+        router.replace(data.role === "admin" ? "/admin" : "/viewer");
+      } catch {
+        if (!cancelled) {
+          setError("");
         }
       }
     };
 
-    ws.onerror = () => {
-      clearTimeout(timeout);
-      setError("无法连接到同步服务");
-      setLoading(false);
-    };
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("error") === "auth") {
+      setError("登录态已失效，请重新登录");
+    }
 
-    ws.onclose = (event) => {
-      clearTimeout(timeout);
-      setLoading(false);
-      // 如果是密码错误 (后端返回 4001)
-      if (event.code === 4001) {
-        setError("房间密码错误");
-      }
+    checkAuth();
+    return () => {
+      cancelled = true;
     };
+  }, [router]);
+
+  const handleLogin = async () => {
+    if (!roomPass.trim()) {
+      setError("请输入房间密码");
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+
+    try {
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          roomPass: roomPass.trim(),
+          adminPass: adminPass.trim(),
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok || !data?.ok) {
+        setError(data?.error || "登录失败，请稍后重试");
+        return;
+      }
+
+      router.push(data.role === "admin" ? "/admin" : "/viewer");
+    } catch {
+      setError("无法连接到认证服务");
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -106,11 +107,11 @@ export default function LoginPage() {
                 disabled={loading}
               />
             </div>
-            
+
             {error && <p className="text-red-500 text-sm text-center">{error}</p>}
-            
+
             <Button className="w-full" onClick={handleLogin} disabled={loading}>
-              {loading ? "正在连接..." : "进入房间"}
+              {loading ? "正在登录..." : "进入房间"}
             </Button>
 
             <Alert>

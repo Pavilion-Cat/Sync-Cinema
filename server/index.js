@@ -1,23 +1,34 @@
-require('dotenv').config({ path: require('path').resolve(__dirname, '../.env.local') }); // 生产环境请通过环境变量注入方式设置 .env.local 中的变量，开发环境可直接使用 .env.local 文件
+require('dotenv').config({ path: require('path').resolve(__dirname, '../.env.local') });
 
 const WebSocket = require('ws');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const url = require('url');
+const crypto = require('crypto');
 
-// ====== 适配本地开发环境 ======
-// 使用 path.join 和 __dirname 确保在 Windows/Mac/Linux 都能正确找到 videos 文件夹
-const VIDEO_DIR = process.env.VIDEO_DIR || path.join(__dirname, 'videos');
-// 修改端口为 3001，避免与 Next.js (3000) 冲突
-const PORT = process.env.PORT || 3001; 
-
-const ROOM_PASSWORD = process.env.SYNC_PASSWORD || 'default';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin_control';
-
-// ====== 日志功能模块 ======
+const PORT = Number(process.env.PORT) || 3001;
+const VIDEO_DIR = path.resolve(process.env.VIDEO_DIR || path.join(__dirname, 'videos'));
 const LOG_DIR = path.join(__dirname, 'logs');
-// 确保日志目录存在
+const CLIENT_CLEANUP_INTERVAL_MS = 30000;
+const SIGNIFICANT_DRIFT_SECONDS = 1;
+const LOGIN_WINDOW_MS = 10 * 60 * 1000;
+const LOGIN_MAX_FAILURES = 5;
+const LOGIN_BLOCK_MS = 10 * 60 * 1000;
+const TOKEN_VERSION = 1;
+const VIEWER_TOKEN_TTL_MS = 12 * 60 * 60 * 1000;
+const ADMIN_TOKEN_TTL_MS = 4 * 60 * 60 * 1000;
+const AUTH_COOKIE_NAME = 'sync_auth';
+const AUTH_COOKIE_PATH = '/';
+const ROOM_PASSWORD = process.env.SYNC_PASSWORD;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const AUTH_TOKEN_SECRET = process.env.AUTH_TOKEN_SECRET;
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
+if (!ROOM_PASSWORD || !ADMIN_PASSWORD || !AUTH_TOKEN_SECRET) {
+  console.error('缺少必要环境变量: SYNC_PASSWORD, ADMIN_PASSWORD, AUTH_TOKEN_SECRET');
+  process.exit(1);
+}
+
 if (!fs.existsSync(LOG_DIR)) {
   try {
     fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -29,8 +40,7 @@ const getLogFilename = () => path.join(LOG_DIR, `server-${new Date().toISOString
 const writeLog = (level, message) => {
   const timestamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
   const logEntry = `[${timestamp}] [${level}] ${message}\n`;
-  
-  // 异步写入文件
+
   fs.appendFile(getLogFilename(), logEntry, (err) => {
     if (err) console.error('写入日志失败:', err);
   });
@@ -43,9 +53,7 @@ const serverLog = (level, message) => {
   }
   writeLog(level, message);
 };
-// ===========================
 
-// ====== 核心逻辑 ======
 let authoritativeState = {
   currentFile: null,
   baseTime: 0,
@@ -54,11 +62,156 @@ let authoritativeState = {
   adminClientId: null
 };
 
-// ====== 获取客户端 IP 的辅助函数 ======
+const loginAttempts = new Map();
+
+const encodeBase64Url = (value) => Buffer.from(value).toString('base64url');
+const decodeBase64Url = (value) => Buffer.from(value, 'base64url').toString('utf8');
+
+const parseCookies = (req) => {
+  const cookieHeader = req.headers.cookie;
+  if (!cookieHeader) return {};
+
+  return cookieHeader.split(';').reduce((acc, part) => {
+    const [rawName, ...rawValueParts] = part.trim().split('=');
+    if (!rawName) return acc;
+    acc[rawName] = decodeURIComponent(rawValueParts.join('='));
+    return acc;
+  }, {});
+};
+
+const signToken = (payload) => {
+  const encodedPayload = encodeBase64Url(JSON.stringify(payload));
+  const signature = crypto
+    .createHmac('sha256', AUTH_TOKEN_SECRET)
+    .update(encodedPayload)
+    .digest('base64url');
+  return `${encodedPayload}.${signature}`;
+};
+
+const verifyToken = (token) => {
+  if (!token || typeof token !== 'string') return null;
+  const [encodedPayload, signature] = token.split('.');
+  if (!encodedPayload || !signature) return null;
+
+  const expectedSignature = crypto
+    .createHmac('sha256', AUTH_TOKEN_SECRET)
+    .update(encodedPayload)
+    .digest('base64url');
+
+  const signatureBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expectedSignature);
+  if (signatureBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(signatureBuffer, expectedBuffer)) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(decodeBase64Url(encodedPayload));
+    if (payload.ver !== TOKEN_VERSION || !payload.role || !payload.exp || Date.now() > payload.exp) {
+      return null;
+    }
+    return payload;
+  } catch (error) {
+    return null;
+  }
+};
+
+const createAuthToken = (role) => {
+  const now = Date.now();
+  return signToken({
+    role,
+    iat: now,
+    exp: now + (role === 'admin' ? ADMIN_TOKEN_TTL_MS : VIEWER_TOKEN_TTL_MS),
+    ver: TOKEN_VERSION
+  });
+};
+
+const createSetCookieValue = (token, maxAgeMs) => {
+  const parts = [
+    `${AUTH_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    `Path=${AUTH_COOKIE_PATH}`,
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${Math.floor(maxAgeMs / 1000)}`
+  ];
+
+  if (IS_PRODUCTION) {
+    parts.push('Secure');
+  }
+
+  return parts.join('; ');
+};
+
+const clearAuthCookieValue = () => {
+  const parts = [
+    `${AUTH_COOKIE_NAME}=`,
+    `Path=${AUTH_COOKIE_PATH}`,
+    'HttpOnly',
+    'SameSite=Lax',
+    'Max-Age=0'
+  ];
+
+  if (IS_PRODUCTION) {
+    parts.push('Secure');
+  }
+
+  return parts.join('; ');
+};
+
+const getAuthPayloadFromRequest = (req) => {
+  const cookies = parseCookies(req);
+  return verifyToken(cookies[AUTH_COOKIE_NAME]);
+};
+
+const getLoginAttemptRecord = (ip) => {
+  const record = loginAttempts.get(ip);
+  if (!record) {
+    return { count: 0, firstFailedAt: 0, blockedUntil: 0 };
+  }
+
+  if (record.blockedUntil && Date.now() > record.blockedUntil) {
+    loginAttempts.delete(ip);
+    return { count: 0, firstFailedAt: 0, blockedUntil: 0 };
+  }
+
+  if (record.firstFailedAt && Date.now() - record.firstFailedAt > LOGIN_WINDOW_MS) {
+    loginAttempts.delete(ip);
+    return { count: 0, firstFailedAt: 0, blockedUntil: 0 };
+  }
+
+  return record;
+};
+
+const isLoginBlocked = (ip) => {
+  const record = getLoginAttemptRecord(ip);
+  return Boolean(record.blockedUntil && record.blockedUntil > Date.now());
+};
+
+const recordLoginFailure = (ip) => {
+  const now = Date.now();
+  const record = getLoginAttemptRecord(ip);
+  const nextRecord = {
+    count: record.count + 1,
+    firstFailedAt: record.firstFailedAt || now,
+    blockedUntil: 0
+  };
+
+  if (nextRecord.count >= LOGIN_MAX_FAILURES) {
+    nextRecord.blockedUntil = now + LOGIN_BLOCK_MS;
+  }
+
+  loginAttempts.set(ip, nextRecord);
+  return nextRecord;
+};
+
+const clearLoginFailures = (ip) => {
+  loginAttempts.delete(ip);
+};
+
 const getClientIP = (req) => {
-  // 优先从 Nginx/代理 获取真实 IP
   let ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'Unknown';
-  // 处理 IPv6 映射的 IPv4 地址 (如 ::ffff:127.0.0.1 -> 127.0.0.1)
+  if (ip.startsWith('::1')) {
+    ip = '127.0.0.1';
+  }
   if (ip.startsWith('::ffff:')) {
     ip = ip.substring(7);
   }
@@ -92,18 +245,30 @@ const getAuthoritativeSnapshot = () => {
   };
 };
 
-// ====== HTTP 服务增加 CORS 和视频文件服务 ======
+const resetAuthoritativeState = () => {
+  authoritativeState = {
+    currentFile: null,
+    baseTime: 0,
+    lastUpdateTime: Date.now(),
+    isPlaying: false,
+    adminClientId: null
+  };
+};
+
+const isSubPath = (parentPath, childPath) => {
+  const relative = path.relative(parentPath, childPath);
+  return relative && !relative.startsWith('..') && !path.isAbsolute(relative);
+};
+
 const server = http.createServer((req, res) => {
-  
-  const ip = getClientIP(req);  
-  // 记录 HTTP 访问日志 (排除 favicon 等静态资源请求，减少日志噪音)
+  const ip = getClientIP(req);
   if (!req.url.includes('favicon')) {
     serverLog('ACCESS', `IP: ${ip} ${req.method} ${req.url}`);
   }
 
-  // 设置 CORS 头，允许 Next.js 前端跨域访问，开发环境使用
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   
   if (req.method === 'OPTIONS') {
     res.writeHead(200);
@@ -111,8 +276,89 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 视频列表 API
+  if (req.url === '/api/auth/me') {
+    const auth = getAuthPayloadFromRequest(req);
+    res.setHeader('Content-Type', 'application/json');
+
+    if (!auth) {
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: true, authenticated: false }));
+      return;
+    }
+
+    res.writeHead(200);
+    res.end(JSON.stringify({ ok: true, authenticated: true, role: auth.role }));
+    return;
+  }
+
+  if (req.url === '/api/auth/logout' && req.method === 'POST') {
+    res.setHeader('Set-Cookie', clearAuthCookieValue());
+    res.setHeader('Content-Type', 'application/json');
+    res.writeHead(200);
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  if (req.url === '/api/auth/login' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk.toString();
+      if (body.length > 1024 * 16) {
+        req.destroy();
+      }
+    });
+
+    req.on('end', () => {
+      if (isLoginBlocked(ip)) {
+        res.setHeader('Content-Type', 'application/json');
+        res.writeHead(429);
+        res.end(JSON.stringify({ ok: false, error: '尝试次数过多，请稍后再试' }));
+        return;
+      }
+
+      let payload;
+      try {
+        payload = body ? JSON.parse(body) : {};
+      } catch (error) {
+        res.setHeader('Content-Type', 'application/json');
+        res.writeHead(400);
+        res.end(JSON.stringify({ ok: false, error: '请求格式无效' }));
+        return;
+      }
+
+      const roomPass = typeof payload.roomPass === 'string' ? payload.roomPass : '';
+      const adminPass = typeof payload.adminPass === 'string' ? payload.adminPass : '';
+
+      if (roomPass !== ROOM_PASSWORD) {
+        const attempt = recordLoginFailure(ip);
+        serverLog('WARN', `登录失败: 房间密码错误 (IP: ${ip}, 次数: ${attempt.count})`);
+        res.setHeader('Content-Type', 'application/json');
+        res.writeHead(401);
+        res.end(JSON.stringify({ ok: false, error: '房间密码错误' }));
+        return;
+      }
+
+      clearLoginFailures(ip);
+      const role = adminPass && adminPass === ADMIN_PASSWORD ? 'admin' : 'viewer';
+      const token = createAuthToken(role);
+      const ttl = role === 'admin' ? ADMIN_TOKEN_TTL_MS : VIEWER_TOKEN_TTL_MS;
+      res.setHeader('Set-Cookie', createSetCookieValue(token, ttl));
+      res.setHeader('Content-Type', 'application/json');
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: true, role }));
+    });
+    return;
+  }
+
   if (req.url === '/api/videos') {
+    const auth = getAuthPayloadFromRequest(req);
+    if (!auth) {
+      res.setHeader('Content-Type', 'application/json');
+      res.writeHead(401);
+      res.end(JSON.stringify({ ok: false, error: '未登录或登录已过期' }));
+      return;
+    }
+
     fs.readdir(VIDEO_DIR, (err, files) => {
       if (err) {
         console.error('视频目录读取失败:', err);
@@ -124,19 +370,17 @@ const server = http.createServer((req, res) => {
       
       const mp4s = files.filter(f => f.toLowerCase().endsWith('.mp4')).sort();
       res.setHeader('Content-Type', 'application/json');
-      res.setHeader('Cache-Control', 'public, max-age=60');
+      res.setHeader('Cache-Control', 'private, max-age=60');
       res.end(JSON.stringify(mp4s));
     });
     return;
   }
 
-  // 视频文件服务 
-  // 匹配 /videos/xxx.mp4 请求
   if (req.url.startsWith('/videos/')) {
-    const filePath = path.join(VIDEO_DIR, decodeURIComponent(req.url.replace('/videos/', '')));
-    
-    // 安全检查：防止路径穿越攻击
-    if (!filePath.startsWith(VIDEO_DIR)) {
+    const requestedFile = decodeURIComponent(req.url.replace('/videos/', ''));
+    const filePath = path.resolve(VIDEO_DIR, requestedFile);
+
+    if (filePath !== VIDEO_DIR && !isSubPath(VIDEO_DIR, filePath)) {
       serverLog('WARN', `路径穿越攻击尝试 (IP: ${ip}, 路径: ${filePath})`);
       res.writeHead(403);
       res.end('Forbidden');
@@ -153,22 +397,30 @@ const server = http.createServer((req, res) => {
 
       const range = req.headers.range;
       if (range) {
-        // 处理 Range 请求 (视频拖动进度条必需)
-        const parts = range.replace(/bytes=/, "").split("-");
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
-        const chunksize = (end - start) + 1;
+        const parts = range.replace(/bytes=/, '').split('-');
+        const start = Number.parseInt(parts[0], 10);
+        const requestedEnd = parts[1] ? Number.parseInt(parts[1], 10) : stat.size - 1;
+        const end = Math.min(requestedEnd, stat.size - 1);
+
+        if (Number.isNaN(start) || Number.isNaN(end) || start < 0 || start > end || start >= stat.size) {
+          res.writeHead(416, {
+            'Content-Range': `bytes */${stat.size}`,
+          });
+          res.end();
+          return;
+        }
+
+        const chunkSize = (end - start) + 1;
         const file = fs.createReadStream(filePath, { start, end });
-        
+
         res.writeHead(206, {
           'Content-Range': `bytes ${start}-${end}/${stat.size}`,
           'Accept-Ranges': 'bytes',
-          'Content-Length': chunksize,
+          'Content-Length': chunkSize,
           'Content-Type': 'video/mp4',
         });
         file.pipe(res);
       } else {
-        // 普通请求
         res.writeHead(200, {
           'Content-Length': stat.size,
           'Content-Type': 'video/mp4',
@@ -179,7 +431,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 404 处理
   res.writeHead(404);
   res.end('Not Found');
 });
@@ -208,24 +459,16 @@ const sendToClient = (clientId, message) => {
 
 wss.on('connection', (ws, request) => {
   const clientId = generateClientId();
-  // 解析 URL 参数 (兼容新版 Node.js)
-  const parsedUrl = url.parse(request.url, true);
-  const params = parsedUrl.query; // 直接使用 query 对象
-  
-  // ====== 新增：获取并记录 IP ======
   const ip = getClientIP(request);
+  const auth = getAuthPayloadFromRequest(request);
 
-  const roomPass = params.pass;
-  const adminPass = params.adminPass;
-
-  if (roomPass !== ROOM_PASSWORD) {
-    serverLog('WARN', `无效房间密码尝试 (ID: ${clientId}, IP: ${ip})`);
-    console.log(`无效房间密码尝试 (ID: ${clientId}, IP: ${ip})`);
-    ws.close(4001, 'Invalid room password');
+  if (!auth) {
+    serverLog('WARN', `无效登录态 WebSocket 尝试 (ID: ${clientId}, IP: ${ip})`);
+    ws.close(4001, 'Invalid auth token');
     return;
   }
 
-  const isAdmin = (adminPass === ADMIN_PASSWORD);
+  const isAdmin = auth.role === 'admin';
 
   if (isAdmin && authoritativeState.adminClientId) {
     const oldAdminId = authoritativeState.adminClientId;
@@ -268,17 +511,14 @@ wss.on('connection', (ws, request) => {
       if (msg.type === 'checkTime' && !isAdmin) {
         const snap = getAuthoritativeSnapshot();
         if (snap) {
-          // 发送特殊类型 timeCheckResult，前端收到后只对比不跳转
           sendToClient(clientId, { type: 'timeCheckResult', ...snap });
           
-          // ====== 开始修改：增加对 msg.time 的判断，防止崩溃 ======
           const clientTime = (typeof msg.time === 'number' && !isNaN(msg.time)) 
                             ? msg.time.toFixed(2) + 's' 
                             : '未上报';
           
           serverLog('TIME_CHECK', `时间检查 (ID: ${clientId}, IP: ${clients.get(clientId)?.ip || 'Unknown'}, 客户端时间: ${clientTime}, 服务器时间: ${snap.time.toFixed(2)}s)`);
           console.log(`[检查响应] ID: ${clientId.slice(0,6)}, IP: ${clients.get(clientId)?.ip || 'Unknown'}, 服务器时间: ${snap.time.toFixed(2)}s`);
-          // ====== 修改结束 ======
         }
         return;
       }
@@ -291,11 +531,17 @@ wss.on('connection', (ws, request) => {
         updateAuthoritativeState(msg.file, 0, false);
         broadcast({ type: 'load', file: msg.file }, clientId);
       } else if (msg.type === 'seek') {
-        const newTime = authoritativeState.isPlaying ? getCurrentAuthoritativeTime() : msg.time;
-        serverLog('SEEK', `跳转进度: ${newTime.toFixed(1)}s (主持人: ${clientId}, IP: ${clients.get(clientId)?.ip || 'Unknown'})`);
-        console.log(`[操作] 跳转进度: ${newTime.toFixed(1)}s (主持人: ${clientId.slice(0,6)}, IP: ${clients.get(clientId)?.ip || 'Unknown'})`);
-        updateAuthoritativeState(authoritativeState.currentFile, newTime, false);
-        broadcast({ type: 'seek', time: newTime }, clientId);
+        const newTime = typeof msg.time === 'number' ? msg.time : getCurrentAuthoritativeTime();
+        const nextPlaying = authoritativeState.isPlaying;
+        serverLog('SEEK', `跳转进度: ${newTime.toFixed(1)}s, 播放状态: ${nextPlaying ? '播放中' : '暂停'} (主持人: ${clientId}, IP: ${clients.get(clientId)?.ip || 'Unknown'})`);
+        console.log(`[操作] 跳转进度: ${newTime.toFixed(1)}s, 播放状态: ${nextPlaying ? '播放中' : '暂停'} (主持人: ${clientId.slice(0,6)}, IP: ${clients.get(clientId)?.ip || 'Unknown'})`);
+        updateAuthoritativeState(authoritativeState.currentFile, newTime, nextPlaying);
+        broadcast({
+          type: 'authoritativeSync',
+          file: authoritativeState.currentFile,
+          time: newTime,
+          playing: nextPlaying
+        }, clientId);
       } else if (msg.type === 'play') {
         const currentTime = getCurrentAuthoritativeTime();
         serverLog('PLAY', `开始播放: 基准时间 ${currentTime.toFixed(1)}s (主持人: ${clientId}, IP: ${clients.get(clientId)?.ip || 'Unknown'})`);
@@ -309,30 +555,27 @@ wss.on('connection', (ws, request) => {
         updateAuthoritativeState(authoritativeState.currentFile, currentTime, false);
         broadcast({ type: 'pause' }, clientId);
       } else if (msg.type === 'heartbeat') {
-        // 1. 获取服务器当前的推算状态（在更新之前）
+        const reportedTime = typeof msg.time === 'number' && Number.isFinite(msg.time)
+          ? msg.time
+          : getCurrentAuthoritativeTime();
         const serverTime = getCurrentAuthoritativeTime();
-        
-        // 2. 计算时间差（误差）
-        const timeDiff = Math.abs(serverTime - msg.time);
+        const timeDiff = Math.abs(serverTime - reportedTime);
 
-        // 3. 详细打印日志
         console.log(`--- [心跳] ID: ${clientId.slice(0,6)}, IP: ${clients.get(clientId)?.ip || 'Unknown'} ---`);
-        console.log(`[客户端上报] 时间: ${msg.time.toFixed(2)}s | 状态: ${msg.playing ? '播放中' : '暂停'}`);
+        console.log(`[客户端上报] 时间: ${reportedTime.toFixed(2)}s | 状态: ${msg.playing ? '播放中' : '暂停'}`);
         console.log(`[服务器推算] 时间: ${serverTime.toFixed(2)}s`);
         console.log(`[同步误差] 差异: ${timeDiff.toFixed(2)}s`);
         console.log(`-----------------------------`);
-        serverLog('HEARTBEAT', `心跳检测 (ID: ${clientId}, IP: ${clients.get(clientId)?.ip || 'Unknown'}, 客户端时间: ${msg.time.toFixed(2)}s, 服务器时间: ${serverTime.toFixed(2)}s, 误差: ${timeDiff.toFixed(2)}s)`);
+        serverLog('HEARTBEAT', `心跳检测 (ID: ${clientId}, IP: ${clients.get(clientId)?.ip || 'Unknown'}, 客户端时间: ${reportedTime.toFixed(2)}s, 服务器时间: ${serverTime.toFixed(2)}s, 误差: ${timeDiff.toFixed(2)}s)`);
         
-        // 4. 如果误差过大（例如超过1秒），给出明显警告
-        if (timeDiff > 1.0) {
+        if (timeDiff > SIGNIFICANT_DRIFT_SECONDS) {
           serverLog('WARN', `检测到显著偏差 (ID: ${clientId}, IP: ${clients.get(clientId)?.ip || 'Unknown'}, 误差: ${timeDiff.toFixed(2)}s)`);
           console.log(`警告: 检测到显著偏差! 正在重置基准...`);
         }
 
-        // 5. 执行更新操作
-        updateAuthoritativeState(msg.file, msg.time, msg.playing);
-        serverLog('SYNC', `基准更新 (ID: ${clientId}, IP: ${clients.get(clientId)?.ip || 'Unknown'}, 新基准时间: ${msg.time.toFixed(2)}s)`);
-        console.log(`[校准完成] 新基准已设定为: ${msg.time.toFixed(2)}s (IP: ${clients.get(clientId)?.ip || 'Unknown'})`);
+        updateAuthoritativeState(msg.file, reportedTime, msg.playing);
+        serverLog('SYNC', `基准更新 (ID: ${clientId}, IP: ${clients.get(clientId)?.ip || 'Unknown'}, 新基准时间: ${reportedTime.toFixed(2)}s)`);
+        console.log(`[校准完成] 新基准已设定为: ${reportedTime.toFixed(2)}s (IP: ${clients.get(clientId)?.ip || 'Unknown'})`);
       } else if (msg.type === 'forceSync') {
         serverLog('FORCE_SYNC', `强制同步所有观众 (主持人: ${clientId}, IP: ${clients.get(clientId)?.ip || 'Unknown'})`);
         console.log(`[操作] 强制同步所有观众 (主持人: ${clientId.slice(0,6)}, IP: ${clients.get(clientId)?.ip || 'Unknown'})`);
@@ -349,35 +592,35 @@ wss.on('connection', (ws, request) => {
   ws.on('close', (code, reason) => {
     const client = clients.get(clientId);
     if (client?.isAdmin && authoritativeState.adminClientId === clientId) {
-      authoritativeState = { currentFile: null, baseTime: 0, lastUpdateTime: Date.now(), isPlaying: false, adminClientId: null };
+      resetAuthoritativeState();
       broadcast({ type: 'adminLeft', reason: reason.toString() });
     }
     clients.delete(clientId);
     serverLog('INFO', `客户端断开 (ID: ${clientId}, IP: ${client?.ip || 'Unknown'}, 剩余连接数: ${clients.size})`);
     console.log(`客户端断开 (ID: ${clientId}, IP: ${client?.ip || 'Unknown'}, 剩余: ${clients.size})`);
   });
-  
-  ws.on('error', (err) => clients.delete(clientId));
+
+  ws.on('error', () => clients.delete(clientId));
 });
 
-// 定期清理
 setInterval(() => {
   clients.forEach(({ ws }, clientId) => {
     if (ws.readyState !== WebSocket.OPEN) {
       clients.delete(clientId);
       if (authoritativeState.adminClientId === clientId) {
-        authoritativeState = { currentFile: null, baseTime: 0, lastUpdateTime: Date.now(), isPlaying: false, adminClientId: null };
+        resetAuthoritativeState();
         broadcast({ type: 'adminLeft' });
       }
     }
   });
-}, 30000);
+}, CLIENT_CLEANUP_INTERVAL_MS);
 
 server.listen(PORT, '0.0.0.0', () => {
-  serverLog('INFO', `云阁同步影院后端服务已启动 (端口: ${PORT}, 视频目录: ${VIDEO_DIR})，房间密码: ${ROOM_PASSWORD}, 主持人密码: ${ADMIN_PASSWORD}`);
+  serverLog('INFO', `云阁同步影院后端服务已启动 (端口: ${PORT}, 视频目录: ${VIDEO_DIR})，认证配置已加载`);
   console.log('云阁同步影院后端服务已启动');
   console.log(`服务地址: http://localhost:${PORT}`);
   console.log(`视频目录: ${VIDEO_DIR}`);
-  console.log(`房间密码: ${ROOM_PASSWORD}`);
-  console.log(`主持人密码: ${ADMIN_PASSWORD}`);
+  console.log('SYNC_PASSWORD: configured');
+  console.log('ADMIN_PASSWORD: configured');
+  console.log('AUTH_TOKEN_SECRET: configured');
 });
